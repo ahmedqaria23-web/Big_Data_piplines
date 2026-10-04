@@ -7,6 +7,7 @@ from pymongo.errors import BulkWriteError
 import json
 import hashlib
 from datetime import datetime, timezone
+from pathlib import Path
 
 from config.settings import (
     COLLECTION_RAW,
@@ -16,6 +17,45 @@ from config.settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AmbiguousCheckpointError(RuntimeError):
+    """Raised when multiple IN_PROGRESS checkpoints exist for the same file fingerprint."""
+    pass
+
+
+def compute_file_fingerprint(file_path: Any) -> str:
+    """Computes a deterministic, stable file fingerprint based on filename, size, and mtime."""
+    path = Path(file_path).resolve()
+    stat = path.stat()
+    sig = f"{path.name}_{stat.st_size}_{stat.st_mtime}"
+    return hashlib.md5(sig.encode('utf-8')).hexdigest()
+
+
+def get_active_checkpoint(db: Database, file_fingerprint: str) -> Optional[Dict[str, Any]]:
+    """
+    Finds an active/resumable checkpoint (IN_PROGRESS or FAILED) for a given file fingerprint.
+    Filters out COMPLETED runs so completed runs are never accidentally resumed.
+    If multiple IN_PROGRESS runs exist for the same fingerprint, raises AmbiguousCheckpointError.
+    """
+    in_progress_runs = list(db[COLLECTION_META_STATE].find(
+        {"file_fingerprint": file_fingerprint, "status": "IN_PROGRESS"}
+    ))
+    if len(in_progress_runs) > 1:
+        run_ids = [r.get("id_run") for r in in_progress_runs]
+        raise AmbiguousCheckpointError(
+            f"Ambiguous state: Multiple ({len(in_progress_runs)}) IN_PROGRESS runs found for fingerprint '{file_fingerprint}': {run_ids}"
+        )
+    if len(in_progress_runs) == 1:
+        return in_progress_runs[0]
+
+    failed_runs = list(db[COLLECTION_META_STATE].find(
+        {"file_fingerprint": file_fingerprint, "status": "FAILED"}
+    ).sort("updated_at", -1))
+    if failed_runs:
+        return failed_runs[0]
+
+    return None
 
 
 def compute_idempotency_key(raw_record: Dict[str, Any], id_order_val: Any = None) -> str:
@@ -246,21 +286,31 @@ def find_validated_sample(db: Database, limit: int = 100, filter_query: Dict[str
 
 # --- Quarantine Repository Functions ---
 
+def compute_quarantine_key(record: Dict[str, Any]) -> str:
+    """
+    Computes a deterministic, source-occurrence unique identity (_id) for quarantine records:
+    <id_run>:<source_row_number>
+    """
+    id_run = str(record.get("id_run") or "unknown_run").strip()
+    source_row = (
+        record.get("source_row_number")
+        if record.get("source_row_number") is not None
+        else record.get("number_row_source", 0)
+    )
+    return f"{id_run}:{source_row}"
+
+
 def insert_quarantine_batch(db: Database, records: List[Dict[str, Any]]) -> int:
     if not records:
         return 0
     bulk_ops = []
     for rec in records:
-        id_order = rec.get("id_order")
         rec_to_insert = rec.copy()
-        rec_to_insert.pop("_id", None)
-        if id_order:
-            filter_q = {"id_order": id_order}
-        else:
-            id_run = rec.get("id_run", "no_run")
-            source_row = rec.get("source_row_number", 0)
-            filter_q = {"id_run": id_run, "source_row_number": source_row}
-        bulk_ops.append(ReplaceOne(filter_q, rec_to_insert, upsert=True))
+        quar_id = rec_to_insert.get("_id") or compute_quarantine_key(rec_to_insert)
+        rec_to_insert["_id"] = quar_id
+        if "source_row_number" not in rec_to_insert and "number_row_source" in rec_to_insert:
+            rec_to_insert["source_row_number"] = rec_to_insert["number_row_source"]
+        bulk_ops.append(ReplaceOne({"_id": quar_id}, rec_to_insert, upsert=True))
 
     try:
         db[COLLECTION_QUARANTINE].bulk_write(bulk_ops, ordered=False)
@@ -280,6 +330,7 @@ def insert_quarantine_batch(db: Database, records: List[Dict[str, Any]]) -> int:
         raise RuntimeError(
             f"BulkWriteError in insert_quarantine_batch: {failed_count} write operations failed."
         ) from bwe
+
 
 
 def count_quarantine(db: Database, filter_query: Dict[str, Any] = None) -> int:

@@ -29,7 +29,11 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from pymongo.database import Database
 
-from config.settings import COLLECTION_META_STATE, COLLECTION_VALIDATED
+from config.settings import (
+    COLLECTION_META_STATE,
+    COLLECTION_VALIDATED,
+    COLLECTION_PROCESSED_EVENTS
+)
 from src.mongodb.repositories import upsert_validated_batch
 
 
@@ -78,6 +82,9 @@ def initial_load(
             "inserted": 0,
             "updated": 0,
             "unchanged": 0,
+            "count_inserted": 0,
+            "count_updated": 0,
+            "count_unchanged": 0,
             "watermark": "1970-01-01T00:00:00Z"
         }
 
@@ -86,6 +93,16 @@ def initial_load(
         ts = r.get("updated_at") or r.get("order_date") or "1970-01-01T00:00:00Z"
         if ts > max_ts:
             max_ts = ts
+        event_id = r.get("event_id")
+        if event_id:
+            try:
+                db[COLLECTION_PROCESSED_EVENTS].update_one(
+                    {"event_id": event_id},
+                    {"$set": {"event_id": event_id, "id_order": r.get("id_order"), "processed_at": datetime.now(timezone.utc).isoformat()}},
+                    upsert=True
+                )
+            except Exception:
+                pass
 
     inserted, updated, unchanged = upsert_validated_batch(db, records)
     save_watermark(db, max_ts, pipeline_name, {"mode": "initial_load", "baseline_records": len(records)})
@@ -96,6 +113,9 @@ def initial_load(
         "inserted": inserted,
         "updated": updated,
         "unchanged": unchanged,
+        "count_inserted": inserted,
+        "count_updated": updated,
+        "count_unchanged": unchanged,
         "watermark": max_ts
     }
 
@@ -104,38 +124,57 @@ def process_delta_batch(
     db: Database,
     records: List[Dict[str, Any]],
     pipeline_name: str = "path_b_incremental",
-    force_process: bool = False
+    force_process: bool = False,
+    replay_mode: bool = False
 ) -> Dict[str, Any]:
     """
     Processes an Incremental Delta Batch containing new and modified records.
     Filters by Watermark (`updated_at > watermark`), enforces version conflict resolution,
     and performs idempotent upsert into `orders_validated`.
+
+    Watermark Semantics:
+    - Normal CDC mode (replay_mode=False, force_process=False):
+      Records with updated_at <= watermark are classified as 'filtered_by_watermark' (already committed).
+      They do NOT reach the Upsert layer, so they are not artificially claimed as 'unchanged'.
+    - Replay mode (replay_mode=True or force_process=True):
+      Records are explicitly evaluated through the Upsert layer to verify business state idempotency.
+      Identical records are detected by is_business_state_equal() and counted as 'unchanged'.
     """
     watermark = get_watermark(db, pipeline_name)
 
-    # 1. Discover Delta Records
-    if force_process:
+    # 1. Discover Delta Records vs Filtered Stale Records
+    delta_records = []
+    filtered_stale = []
+
+    if force_process or replay_mode:
         delta_records = records
     else:
-        delta_records = [
-            r for r in records
-            if (r.get("updated_at") or r.get("order_date") or "9999-12-31T23:59:59Z") > watermark
-        ]
+        for r in records:
+            rec_ts = r.get("updated_at") or r.get("order_date") or "9999-12-31T23:59:59Z"
+            if rec_ts > watermark:
+                delta_records.append(r)
+            else:
+                filtered_stale.append(r)
 
     if not delta_records:
         return {
             "mode": "delta_load",
             "watermark_used": watermark,
-            "delta_records_read": 0,
+            "delta_records_read": len(records),
+            "filtered_by_watermark": len(filtered_stale),
             "processed_count": 0,
             "inserted": 0,
             "updated": 0,
             "unchanged": 0,
+            "count_inserted": 0,
+            "count_updated": 0,
+            "count_unchanged": 0,
             "conflicts_rejected": 0,
+            "events_skipped": 0,
             "new_watermark": watermark
         }
 
-    # 2. Conflict Resolution (Latest-Wins & Version Check)
+    # 2. Conflict Resolution (Latest-Wins & Version Check & Cumulative Events)
     id_orders = [
         str(r.get("id_order") or r.get("order_id")).strip()
         for r in delta_records
@@ -148,6 +187,7 @@ def process_delta_batch(
 
     eligible_records = []
     conflicts_rejected = 0
+    events_skipped = 0
     max_watermark = watermark
 
     for rec in delta_records:
@@ -157,6 +197,14 @@ def process_delta_batch(
         id_order = str(raw_id).strip()
         rec["id_order"] = id_order
 
+        # Cumulative Operation Protection: check event_id deduplication
+        event_id = rec.get("event_id")
+        if event_id:
+            existing_event = db[COLLECTION_PROCESSED_EVENTS].find_one({"event_id": event_id})
+            if existing_event:
+                events_skipped += 1
+                continue
+
         incoming_ver = rec.get("version", 1)
         rec_ts = rec.get("updated_at") or rec.get("order_date") or watermark
 
@@ -165,6 +213,7 @@ def process_delta_batch(
             stored_ver = stored_doc.get("version", 0)
             stored_ts = stored_doc.get("updated_at") or stored_doc.get("order_date") or "1970-01-01T00:00:00Z"
 
+            # Version/Timestamp Conflict Handling
             if incoming_ver > stored_ver or (incoming_ver == stored_ver and rec_ts >= stored_ts):
                 eligible_records.append(rec)
             else:
@@ -175,8 +224,22 @@ def process_delta_batch(
         if rec_ts > max_watermark:
             max_watermark = rec_ts
 
-    # 3. Perform atomic upsert for eligible delta records only
+    # 3. Perform atomic upsert for eligible delta records
     inserted, updated, unchanged = upsert_validated_batch(db, eligible_records)
+
+    # Persist processed events to prevent replaying cumulative side effects
+    for rec in eligible_records:
+        e_id = rec.get("event_id")
+        if e_id:
+            try:
+                db[COLLECTION_PROCESSED_EVENTS].update_one(
+                    {"event_id": e_id},
+                    {"$set": {"event_id": e_id, "id_order": rec.get("id_order"), "processed_at": datetime.now(timezone.utc).isoformat()}},
+                    upsert=True
+                )
+            except Exception:
+                pass
+
     save_watermark(db, max_watermark, pipeline_name, {
         "mode": "delta_load",
         "last_delta_size": len(eligible_records)
@@ -185,11 +248,16 @@ def process_delta_batch(
     return {
         "mode": "delta_load",
         "watermark_used": watermark,
-        "delta_records_read": len(delta_records),
+        "delta_records_read": len(records),
+        "filtered_by_watermark": len(filtered_stale),
         "processed_count": len(eligible_records),
         "inserted": inserted,
         "updated": updated,
         "unchanged": unchanged,
+        "count_inserted": inserted,
+        "count_updated": updated,
+        "count_unchanged": unchanged,
         "conflicts_rejected": conflicts_rejected,
+        "events_skipped": events_skipped,
         "new_watermark": max_watermark
     }

@@ -35,6 +35,20 @@ def save_results(metrics: Dict[str, Any], report_dir: Path = REPORT_DIR):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
+def verify_consistency_equation(
+    run_raw_count: int,
+    run_valid_count: int,
+    run_corrected_count: int,
+    run_quarantine_count: int
+) -> bool:
+    """
+    Verifies the fundamental ELT consistency equation:
+    run_raw_count = run_valid_count + run_corrected_count + run_quarantine_count
+    Zero data loss guarantee: every raw record ends in exactly one processing result.
+    """
+    return run_raw_count == (run_valid_count + run_corrected_count + run_quarantine_count)
+
+
 def calculate_and_verify_metrics(
     id_run: str,
     file_name: str,
@@ -58,7 +72,15 @@ def calculate_and_verify_metrics(
 ) -> Dict[str, Any]:
     
     sum_classified = count_valid + count_corrected + count_quarantine
-    consistency_equation_verified = (loaded_raw == sum_classified)
+    consistency_equation_verified = verify_consistency_equation(
+        run_raw_count=loaded_raw,
+        run_valid_count=count_valid,
+        run_corrected_count=count_corrected,
+        run_quarantine_count=count_quarantine
+    )
+
+    # Strictly verify throughput = read_rows / seconds_elapsed from actual observed execution
+    observed_throughput = round(read_rows / seconds_elapsed, 2) if seconds_elapsed > 0 else 0.0
 
     metrics = {
         "id_run": id_run,
@@ -72,18 +94,22 @@ def calculate_and_verify_metrics(
         "loaded_raw": loaded_raw,
         "run_raw_count": loaded_raw,
         "count_valid": count_valid,
+        "run_valid_count": count_valid,
         "count_corrected": count_corrected,
+        "run_corrected_count": count_corrected,
         "count_quarantine": count_quarantine,
+        "run_quarantine_count": count_quarantine,
         "sum_classified": sum_classified,
         "consistency_equation_verified": consistency_equation_verified,
         "count_inserted": count_inserted,
         "count_updated": count_updated,
         "count_unchanged": count_unchanged,
         "seconds_elapsed": seconds_elapsed,
-        "throughput": throughput,
-        "throughput_records_per_sec": throughput,
+        "throughput": observed_throughput,
+        "throughput_records_per_sec": observed_throughput,
         "size_batch": batch_or_partitions if used_engine == "python_batch" else None,
         "partitions": batch_or_partitions if used_engine == "pyspark" else None,
+        "input_partitions": batch_or_partitions if used_engine == "pyspark" else None,
         "batch_or_partitions": batch_or_partitions,
         "counts_case_error": counts_case_error
     }

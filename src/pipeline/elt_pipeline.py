@@ -49,7 +49,8 @@ def _stream_cursor_chunks(cursor, chunk_size: int):
 def run_elt_pipeline(
     file_path: str,
     db: Optional[Database] = None,
-    progress_callback: Optional[Callable[[str, float], None]] = None
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+    threshold_mb: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Executes the full ELT pipeline:
@@ -73,7 +74,10 @@ def run_elt_pipeline(
 
     # Step 1: File Discovery & Router Selection
     update_progress("Step 1/6: Discovering file & selecting engine...", 0.1)
-    routing = inspect_and_route(file_path)
+    if threshold_mb is not None:
+        routing = inspect_and_route(file_path, threshold_mb=threshold_mb, db=db)
+    else:
+        routing = inspect_and_route(file_path, db=db)
     id_run = routing["id_run"]
     engine = routing["selected_engine"]
     file_size_mb = routing["file_size_mb"]

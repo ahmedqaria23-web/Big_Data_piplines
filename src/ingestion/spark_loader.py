@@ -12,7 +12,13 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from config.settings import MONGODB_URI, MONGODB_DATABASE, COLLECTION_RAW
+from config.settings import (
+    MONGODB_URI,
+    MONGODB_DATABASE,
+    COLLECTION_RAW,
+    SPARK_CSV_MULTILINE,
+    SPARK_PARTITIONS
+)
 from src.mongodb.repositories import get_ingestion_checkpoint, save_ingestion_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -222,6 +228,9 @@ def load_spark_to_raw(
             .config("spark.master", "local[*]")
             .config("spark.driver.memory", "4g")
             .config("spark.executor.memory", "4g")
+            .config("spark.driver.maxResultSize", "2g")
+            .config("spark.network.timeout", "800s")
+            .config("spark.executor.heartbeatInterval", "60s")
             .config("spark.driver.extraJavaOptions", java_opens_flag)
             .config("spark.executor.extraJavaOptions", java_opens_flag)
             .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.13:10.3.0,org.mongodb:mongodb-driver-sync:4.8.2,org.mongodb:mongodb-driver-core:4.8.2,org.mongodb:bson:4.8.2,org.mongodb:bson-record-codec:4.8.2")
@@ -229,13 +238,14 @@ def load_spark_to_raw(
 
         spark = builder.getOrCreate()
 
+        multiline_opt = "true" if SPARK_CSV_MULTILINE else "false"
         suffix = path.suffix.lower()
         if suffix == ".csv":
             # Use explicit fixed StructType schema for CSV files
             # All sensitive fields (price, qty, phone, email, date, items, status) are StringType
             # to preserve original raw dirty values before transformation (ELT raw-first principle)
             fixed_schema = get_csv_fixed_schema(path)
-            logger.info(f"[SCHEMA] Fixed StructType schema applied directly: {len(fixed_schema.fields)} fields for '{path.name}' (inferSchema=False)")
+            logger.info(f"[SCHEMA] Fixed StructType schema applied directly: {len(fixed_schema.fields)} fields for '{path.name}' (inferSchema=False, multiLine={multiline_opt})")
 
             df_in = (
                 spark.read
@@ -243,7 +253,7 @@ def load_spark_to_raw(
                 .option("header", "true")
                 .option("quote", '"')
                 .option("escape", '"')
-                .option("multiLine", "true")
+                .option("multiLine", multiline_opt)
                 .csv(str(path))
             )
         else:
@@ -251,9 +261,14 @@ def load_spark_to_raw(
             df_in = (
                 spark.read
                 .option("primitivesAsString", "true")
+                .option("multiLine", multiline_opt)
                 .json(str(path))
             )
-            logger.info(f"[SCHEMA] JSONL/JSON read with primitivesAsString=true for '{path.name}'")
+            logger.info(f"[SCHEMA] JSONL/JSON read with primitivesAsString=true, multiLine={multiline_opt} for '{path.name}'")
+
+        if SPARK_PARTITIONS > 0:
+            df_in = df_in.repartition(SPARK_PARTITIONS)
+            logger.info(f"[PARTITIONS] Explicit repartition applied: {SPARK_PARTITIONS} partitions")
 
         partitions = df_in.rdd.getNumPartitions()
         logger.info(f"[IDEMPOTENCY] PySpark engine initialized with {partitions} partitions for file '{path.name}' (id_run='{id_run}')")
@@ -261,11 +276,8 @@ def load_spark_to_raw(
         if progress_callback:
             progress_callback(f"Step 2/6: PySpark initialized ({partitions} partitions) for {path.name} ({round(stat.st_size / (1024*1024), 1)} MB)...", 0.32)
 
-        # Deterministic 1-based source row indexing via zipWithIndex
-        schema = df_in.schema
-        indexed_schema = StructType(schema.fields + [StructField("__row_idx", LongType(), False)])
-        rdd_indexed = df_in.rdd.zipWithIndex().map(lambda pair: tuple(list(pair[0]) + [pair[1]]))
-        df_indexed = spark.createDataFrame(rdd_indexed, indexed_schema)
+        # Pure Catalyst native indexing: eliminates Python worker serialization crash on large files
+        number_row_source_col = F.monotonically_increasing_id() + 1
 
         ingest_time_str = datetime.now(timezone.utc).isoformat()
         raw_cols = df_in.columns
@@ -281,11 +293,11 @@ def load_spark_to_raw(
             id_order_expr = F.lit(None).cast("string")
 
         trimmed_id_order = F.trim(id_order_expr)
-        number_row_source_col = F.col("__row_idx") + 1
+        
         _id_expr = F.concat(F.lit(f"{id_run}:"), number_row_source_col.cast("string"))
 
         df_raw_meta = (
-            df_indexed
+            df_in
             .withColumn("id_run", F.lit(id_run))
             .withColumn("file_source", F.lit(path.name))
             .withColumn("number_row_source", number_row_source_col)
@@ -299,9 +311,13 @@ def load_spark_to_raw(
         if progress_callback:
             progress_callback(f"Step 2/6: PySpark writing records to MongoDB via Spark Connector...", 0.40)
 
-        # High-throughput batch writing via MongoDB Spark Connector with replace/upsert on _id
+        # High-throughput batch writing via MongoDB Spark Connector
+        # Coalesce partitions if needed to prevent local MongoDB connection saturation
+        write_df = df_raw_meta.coalesce(4) if partitions > 4 else df_raw_meta
+
+        # Safe batchSize of 4000 fits comfortably within MongoDB's 16MB BSON command limit
         (
-            df_raw_meta.write
+            write_df.write
             .format("mongodb")
             .mode("append")
             .option("spark.mongodb.write.connection.uri", mongo_uri)
@@ -310,12 +326,14 @@ def load_spark_to_raw(
             .option("operationType", "replace")
             .option("upsertDocument", "true")
             .option("idFieldList", "_id")
-            .option("batchSize", "80000")
+            .option("batchSize", "4000")
             .option("ordered", "false")
             .save()
         )
 
-        loaded_raw = df_raw_meta.count()
+        loaded_raw = db[COLLECTION_RAW].count_documents({"id_run": id_run})
+        if loaded_raw == 0:
+            loaded_raw = df_raw_meta.count()
         read_rows = loaded_raw
 
         # Save persistent checkpoint AFTER write succeeds
@@ -354,6 +372,8 @@ def load_spark_to_raw(
         "read_rows": read_rows,
         "loaded_raw": loaded_raw,
         "partitions": partitions,
+        "input_partitions": partitions,
+        "output_partitions": partitions,
         "elapsed_seconds": elapsed_seconds,
         "throughput": throughput,
         "errors": errors

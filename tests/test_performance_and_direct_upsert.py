@@ -89,6 +89,63 @@ def test_requirement_10_modified_document_upsert(test_db):
     assert count_validated(test_db, {"id_order": "REQ-10-MOD-001"}) == 1
 
 
+def test_upsert_policy_test_a_b_c_lifecycle(test_db):
+    """
+    Task 7 End-to-End Idempotency & Upsert Lifecycle:
+    - Verifies unique index on id_order in orders_validated
+    - TEST A: First Run -> inserted = N, updated = 0, unchanged = 0
+    - TEST B: Replay -> inserted = 0, updated = 0, unchanged = N (count does not increase)
+    - TEST C: Update -> inserted = 0, updated = 1 (no duplicates created)
+    """
+    val_coll = test_db["orders_validated"]
+
+    # Verify unique index
+    indexes = val_coll.index_information()
+    has_unique = any(
+        "id_order" in [k[0] for k in idx.get("key", [])] and idx.get("unique")
+        for idx in indexes.values()
+    )
+    assert has_unique is True, "Unique index on id_order must exist in orders_validated"
+
+    # Prepare 5 records
+    orders = [make_valid_order_doc(f"ORD-LIFE-{i:03d}") for i in range(1, 6)]
+
+    # TEST A: First Run
+    ins_a, upd_a, unc_a = upsert_validated_batch(test_db, [dict(o) for o in orders])
+    assert ins_a == 5
+    assert upd_a == 0
+    assert unc_a == 0
+    assert val_coll.count_documents({}) == 5
+
+    # TEST B: Replay identical records with updated runtime tracking metadata
+    replay_orders = []
+    for o in orders:
+        r = dict(o)
+        r["id_run"] = "replay_run_002"
+        r["processed_at"] = "2026-09-02T23:59:59Z"
+        replay_orders.append(r)
+
+    ins_b, upd_b, unc_b = upsert_validated_batch(test_db, replay_orders)
+    assert ins_b == 0, f"Expected 0 inserted, got {ins_b}"
+    assert upd_b == 0, f"Expected 0 updated, got {upd_b}"
+    assert unc_b == 5, f"Expected 5 unchanged, got {unc_b}"
+    assert val_coll.count_documents({}) == 5, "Validated count must NOT increase on replay"
+
+    for o in orders:
+        assert val_coll.count_documents({"id_order": o["id_order"]}) == 1
+
+    # TEST C: Update single record
+    mod_order = dict(orders[0])
+    mod_order["status"] = "تم التسليم"
+    ins_c, upd_c, unc_c = upsert_validated_batch(test_db, [mod_order])
+    assert ins_c == 0
+    assert upd_c == 1
+    assert unc_c == 0
+    assert val_coll.count_documents({}) == 5
+    assert val_coll.count_documents({"id_order": orders[0]["id_order"]}) == 1
+    assert val_coll.find_one({"id_order": orders[0]["id_order"]})["status"] == "تم التسليم"
+
+
 def test_requirement_13_parallel_vs_sequential_identity():
     """Requirement 13: Parallel classification produces 100% identical outputs to sequential classification."""
     raw_docs = [
